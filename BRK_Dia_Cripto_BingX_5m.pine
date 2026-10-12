@@ -1,0 +1,415 @@
+//@version=6
+// =============================================================================
+// RUPTURA DEL DÍA · CRIPTO BINGX · 5 MINUTOS · LONG Y SHORT (educativa)
+//
+// Adaptación de la idea "ruptura del máximo del día + filtros" (NQ) a cripto 24/7.
+// TODO está normalizado (ADR, ATR, % del precio), sin puntos fijos ni precios
+// absolutos, así que el MISMO script vale para cualquier par perpetuo de BingX.
+// Pine solo opera el símbolo del gráfico: aplícalo a cada par (lista de seguimiento).
+//
+// Qué cambia respecto a NQ
+//  * Día = UTC 00:00-24:00. Espera N velas antes de operar para que el máximo del
+//    día signifique algo (sustituye a la apertura 09:30).
+//  * Stop = k x ATR (no 12 puntos). Tamaño por riesgo fijo en monedas.
+//  * Sesgo: |cierre - apertura UTC| >= X x ADR (no "dm > 20 puntos").
+//  * Día tranquilo: el rango de AYER < X x ADR (volatilidad agrupada).
+//  * Filtro de costes en R: bloquea las operaciones donde la comisión se come el
+//    riesgo. Es lo que descarta automáticamente los pares/momentos no operables.
+//  * Long y short simétricos (ruptura del máximo / pérdida del mínimo del día).
+//  * Sin anclas. Salida: stop/objetivo/trailing o cierre al final del día UTC.
+//
+// Sin garantía de ventaja. No hay resultados que respalden esta versión en cripto.
+// No modela funding (BingX cobra cada 8 h), liquidación ni diferencias de datos.
+// Contenido educativo; no es asesoramiento financiero.
+// =============================================================================
+strategy("Ruptura del día · Cripto BingX 5m (L/S)", shorttitle = "BRK-D", overlay = true,
+     initial_capital = 1000, pyramiding = 0,
+     default_qty_type = strategy.fixed, default_qty_value = 1,
+     commission_type = strategy.commission.percent, commission_value = 0.05,
+     slippage = 2, margin_long = 20, margin_short = 20,
+     process_orders_on_close = false, calc_on_every_tick = false)
+
+// ------------------------------- Entradas ------------------------------------
+grpH = "1. Ruptura"
+levelMode   = input.string("Máximo/mínimo del día UTC", "Nivel a romper", options = ["Máximo/mínimo del día UTC", "Máximo/mínimo móvil"], group = grpH)
+warmupBars  = input.int(36, "Día UTC: velas mínimas antes de operar (36 = 3 h)", minval = 6, group = grpH)
+rollLen     = input.int(288, "Móvil: ventana en velas (288 = 24 h en 5m)", minval = 24, group = grpH)
+persistBars = input.int(2, "Persistencia: cierres seguidos más allá del nivel", minval = 1, group = grpH,
+     tooltip = "1 = ruptura inmediata. 2 o más filtran parte de las rupturas falsas.")
+allowLong   = input.bool(true, "Permitir largos", group = grpH)
+allowShort  = input.bool(true, "Permitir cortos", group = grpH)
+
+grpF = "2. Filtros (en unidades de ADR)"
+adrLen   = input.int(20, "ADR: días para la media del rango diario", minval = 5, group = grpF)
+useDm    = input.bool(true, "Sesgo: |cierre - apertura UTC| >= X x ADR", group = grpF)
+dmMin    = input.float(0.15, "X (en ADR)", minval = 0.0, step = 0.05, group = grpF)
+useRoom  = input.bool(true, "Espacio: recorrido consumido desde el extremo opuesto <= X x ADR", group = grpF)
+roomThr  = input.float(1.0, "X (en ADR)", minval = 0.3, step = 0.05, group = grpF)
+useQuiet = input.bool(true, "Excluir día tranquilo (rango de ayer < X x ADR)", group = grpF)
+qSpan    = input.float(0.6, "X (en ADR)", minval = 0.1, step = 0.1, group = grpF)
+useVolC  = input.bool(false, "Contracción de volatilidad: ATR(5) diario < ATR(20) diario", group = grpF)
+
+grpE = "3. Horario y entrada (UTC)"
+useHours     = input.bool(false, "Limitar entradas a un horario UTC", group = grpE)
+hFrom        = input.int(7, "Desde (hora UTC)", minval = 0, maxval = 23, group = grpE)
+hTo          = input.int(21, "Hasta (hora UTC, exclusiva)", minval = 1, maxval = 24, group = grpE)
+exitEOD      = input.bool(true, "Cerrar todo al final del día UTC (23:55) y no abrir en la última hora", group = grpE)
+entryMode    = input.string("Mercado (apertura siguiente)", "Tipo de entrada", options = ["Mercado (apertura siguiente)", "Límite en el nivel (retest)"], group = grpE)
+limitBars    = input.int(6, "Límite: velas de espera máximas", minval = 1, group = grpE)
+maxTradesDay = input.int(2, "Operaciones máximas por día UTC", minval = 1, group = grpE)
+
+grpX = "4. Stop, costes y salida"
+atrLen      = input.int(14, "Periodo del ATR (5m)", minval = 2, group = grpX)
+stopATR     = input.float(2.0, "Stop (x ATR)", minval = 0.5, step = 0.25, group = grpX)
+useCostF    = input.bool(true, "Filtro de costes en R", group = grpX)
+rtCostPct   = input.float(0.12, "Coste ida+vuelta (% del precio) - igual que comisión+slippage", minval = 0.0, step = 0.01, group = grpX)
+maxCostR    = input.float(0.20, "Coste máximo en R (coste / distancia al stop)", minval = 0.01, step = 0.01, group = grpX)
+targetR     = input.float(0.0, "Objetivo (múltiplos de R, 0 = sin objetivo)", minval = 0.0, step = 0.5, group = grpX)
+useTrail    = input.bool(false, "Trailing", group = grpX)
+trailStartR = input.float(2.0, "Trailing: se activa tras +x R", minval = 0.5, step = 0.5, group = grpX)
+trailDistR  = input.float(1.5, "Trailing: distancia al extremo (x R)", minval = 0.5, step = 0.5, group = grpX)
+
+grpR = "5. Riesgo"
+riskPct    = input.float(0.5, "Riesgo por operación (% del capital)", minval = 0.05, maxval = 2.0, step = 0.05, group = grpR)
+maxLev     = input.float(3.0, "Apalancamiento máximo (nocional / capital)", minval = 0.5, maxval = 5.0, step = 0.5, group = grpR)
+maxDayLoss = input.float(3.0, "Pérdida diaria máxima (%) - pausa el resto del día", minval = 0.5, step = 0.5, group = grpR)
+
+grpD = "6. Validación"
+useDates  = input.bool(false, "Limitar el backtest a un rango de fechas", group = grpD)
+startDate = input.time(timestamp("01 Jan 2024 00:00 +0000"), "Inicio", group = grpD)
+endDate   = input.time(timestamp("01 Jan 2030 00:00 +0000"), "Fin", group = grpD)
+splitDate = input.time(timestamp("01 Sep 2026 00:00 +0000"), "Fecha de corte dentro/fuera de muestra", group = grpD)
+
+showTable = input.bool(true, "Mostrar tablero")
+
+// ------------------------------ Comprobaciones -------------------------------
+if timeframe.in_seconds() != 300
+    runtime.error("Esta estrategia está pensada para un gráfico de 5 minutos.")
+
+// ------------------------------- Funciones -----------------------------------
+f_wilsonLB(float w, float n) =>
+    float res = na
+    if n > 0
+        float zc = 1.96
+        float p  = w / n
+        res := (p + zc * zc / (2.0 * n) - zc * math.sqrt(p * (1.0 - p) / n + zc * zc / (4.0 * n * n))) / (1.0 + zc * zc / n)
+    res
+
+calcQty(float riskDist) =>
+    float byRisk = strategy.equity * riskPct / 100.0 / riskDist
+    float byLev  = strategy.equity * maxLev / close
+    float raw    = math.min(byRisk, byLev)
+    float stepQ  = syminfo.mincontract
+    stepQ > 0 ? math.floor(raw / stepQ) * stepQ : raw
+
+msgEntry(string side, float q, float stp) =>
+    '{"action":"' + side + '","symbol":"' + syminfo.ticker + '","qty":' + str.tostring(q) + ',"stop":' + str.tostring(stp) + '}'
+
+msgClose() =>
+    '{"action":"close","symbol":"' + syminfo.ticker + '"}'
+
+// ------------------------------- Tiempo y datos diarios ----------------------
+int  dUTC   = dayofmonth(time, "UTC")
+int  hUTC   = hour(time, "UTC")
+int  mUTC   = minute(time, "UTC")
+bool newDay = na(dUTC[1]) or dUTC != dUTC[1]
+
+[adr, prevRng, atr5D, atr20D] = request.security(syminfo.tickerid, "D",
+     [ta.sma(high - low, adrLen)[1], (high - low)[1], ta.atr(5)[1], ta.atr(20)[1]],
+     lookahead = barmerge.lookahead_on)
+
+float atrV = ta.atr(atrLen)
+float hi24 = ta.highest(high, rollLen)[1]
+float lo24 = ta.lowest(low, rollLen)[1]
+
+bool inDates = not useDates or (time >= startDate and time <= endDate)
+bool hoursOk = not useHours or (hFrom <= hTo ? (hUTC >= hFrom and hUTC < hTo) : (hUTC >= hFrom or hUTC < hTo))
+bool eodBlock = exitEOD and hUTC >= 23
+
+// ------------------------------- Estado del día ------------------------------
+var float dayOpen = na
+var float dayHigh = na
+var float dayLow  = na
+var int   dayBars = 0
+if newDay
+    dayOpen := open
+    dayHigh := high
+    dayLow  := low
+    dayBars := 1
+else
+    dayHigh := math.max(dayHigh, high)
+    dayLow  := math.min(dayLow, low)
+    dayBars += 1
+
+bool  dayMode  = levelMode == "Máximo/mínimo del día UTC"
+float lvlH     = dayMode ? dayHigh[1] : hi24
+float lvlLo    = dayMode ? dayLow[1] : lo24
+bool  lvlReady = dayMode ? dayBars > warmupBars : bar_index > rollLen
+
+// ------------------------------- Señal de ruptura ----------------------------
+var bool  armL = false
+var float armLvlL = na
+var int   cntL = 0
+var bool  armS = false
+var float armLvlS = na
+var int   cntS = 0
+if newDay
+    armL := false
+    cntL := 0
+    armS := false
+    cntS := 0
+
+if armL
+    if close > armLvlL
+        cntL += 1
+    else
+        armL := false
+        cntL := 0
+else if lvlReady and not na(lvlH) and close > lvlH
+    armL := true
+    armLvlL := lvlH
+    cntL := 1
+bool sigL = armL and cntL == persistBars
+
+if armS
+    if close < armLvlS
+        cntS += 1
+    else
+        armS := false
+        cntS := 0
+else if lvlReady and not na(lvlLo) and close < lvlLo
+    armS := true
+    armLvlS := lvlLo
+    cntS := 1
+bool sigS = armS and cntS == persistBars
+
+// ------------------------------- Filtros -------------------------------------
+bool adrOk   = not na(adr) and adr > 0
+bool okDmL   = not useDm or (adrOk and close - dayOpen >= dmMin * adr)
+bool okDmS   = not useDm or (adrOk and dayOpen - close >= dmMin * adr)
+bool okRoomL = not useRoom or (adrOk and (close - dayLow) / adr <= roomThr)
+bool okRoomS = not useRoom or (adrOk and (dayHigh - close) / adr <= roomThr)
+bool quietDay = adrOk and not na(prevRng) and prevRng < qSpan * adr
+bool okQuiet = not useQuiet or not quietDay
+bool okVol   = not useVolC or (not na(atr5D) and not na(atr20D) and atr5D < atr20D)
+
+// ------------------------------- Estado de operaciones -----------------------
+var int   tradesToday  = 0
+var bool  pendingLimit = false
+var int   pendUntil    = 0
+var string pendId      = ""
+var float curStop      = na
+var float riskEntry    = na
+var float hwm          = na
+var float entryRiskUSD = na
+var int   lastClosed   = 0
+var float lastNet      = 0.0
+var float dayStartEq   = strategy.initial_capital
+var bool  dayBlocked   = false
+var float netAtSplit   = na
+
+var int   nT = 0
+var int   nW = 0
+var int   nLong = 0
+var int   nShort = 0
+var int   nBlocked = 0
+var float sumR = 0.0
+var float sumR2 = 0.0
+var float sumWinR = 0.0
+var float sumLossR = 0.0
+var array<float> rList = array.new_float()
+var array<int>   wKeys = array.new_int()
+var array<float> wSums = array.new_float()
+var int   firstT = na
+var float firstClose = na
+var float lastClose  = na
+if na(firstT)
+    firstT := time
+if inDates and na(firstClose)
+    firstClose := close
+if inDates
+    lastClose := close
+if na(netAtSplit) and time >= splitDate
+    netAtSplit := strategy.netprofit
+
+if newDay
+    tradesToday := 0
+    dayStartEq := strategy.equity
+    dayBlocked := false
+if not dayBlocked and strategy.equity < dayStartEq * (1.0 - maxDayLoss / 100.0)
+    dayBlocked := true
+    if strategy.position_size != 0
+        strategy.close_all(comment = "límite diario", alert_message = msgClose())
+
+// Orden límite pendiente: fin de espera
+if pendingLimit
+    if strategy.position_size != 0
+        pendingLimit := false
+    else if bar_index >= pendUntil or eodBlock
+        strategy.cancel(pendId)
+        pendingLimit := false
+        tradesToday := math.max(0, tradesToday - 1)
+
+// Operación cerrada: R neto con el riesgo fijado al entrar
+if strategy.closedtrades > lastClosed
+    float pnl = strategy.netprofit - lastNet
+    if not na(entryRiskUSD) and entryRiskUSD > 0
+        float rr = pnl / entryRiskUSD
+        nT += 1
+        nW += rr > 0 ? 1 : 0
+        sumR += rr
+        sumR2 += rr * rr
+        if rr > 0
+            sumWinR += rr
+        else
+            sumLossR += -rr
+        array.push(rList, rr)
+        int wk = year(time, "UTC") * 100 + weekofyear(time, "UTC")
+        int wi = array.indexof(wKeys, wk)
+        if wi < 0
+            array.push(wKeys, wk)
+            array.push(wSums, rr)
+        else
+            array.set(wSums, wi, array.get(wSums, wi) + rr)
+    lastNet := strategy.netprofit
+    lastClosed := strategy.closedtrades
+
+// ------------------------- Gestión de la posición abierta --------------------
+if strategy.position_size != 0
+    bool isLong = strategy.position_size > 0
+    float ep = strategy.opentrades.entry_price(0)
+    if nz(strategy.position_size[1]) == 0
+        hwm := isLong ? high : low
+    else
+        hwm := isLong ? math.max(hwm, high) : math.min(hwm, low)
+    if useTrail
+        if isLong and hwm >= ep + trailStartR * riskEntry
+            curStop := math.max(curStop, hwm - trailDistR * riskEntry)
+        else if not isLong and hwm <= ep - trailStartR * riskEntry
+            curStop := math.min(curStop, hwm + trailDistR * riskEntry)
+    float tgt = targetR > 0 ? (isLong ? ep + targetR * riskEntry : ep - targetR * riskEntry) : na
+    strategy.exit(isLong ? "XL" : "XS", from_entry = isLong ? "L" : "S", stop = curStop, limit = tgt, alert_message = msgClose())
+    if (exitEOD and hUTC == 23 and mUTC >= 55) or (useDates and time > endDate)
+        strategy.close_all(comment = "fin del día", alert_message = msgClose())
+
+// -------------------------------- Entrada ------------------------------------
+bool sigLong  = allowLong and sigL and okDmL and okRoomL and okQuiet and okVol
+bool sigShort = allowShort and sigS and okDmS and okRoomS and okQuiet and okVol
+bool canTrade = strategy.position_size == 0 and not pendingLimit and inDates and hoursOk and not eodBlock and not dayBlocked and tradesToday < maxTradesDay and not na(atrV) and adrOk
+
+bool placed = false
+int  placedDir = 0
+if canTrade and (sigLong or sigShort)
+    bool  isL      = sigLong
+    float lvlPx    = isL ? armLvlL : armLvlS
+    float riskDist = stopATR * atrV
+    float costR    = riskDist > 0 ? rtCostPct / 100.0 * close / riskDist : na
+    bool  costBlock = useCostF and (na(costR) or costR > maxCostR)
+    if costBlock
+        nBlocked += 1
+    else
+        bool  useLimit = entryMode == "Límite en el nivel (retest)" and not na(lvlPx) and (isL ? lvlPx < close : lvlPx > close)
+        float refPx    = useLimit ? lvlPx : close
+        float stp      = isL ? refPx - riskDist : refPx + riskDist
+        float q        = riskDist > 0 ? calcQty(riskDist) : 0.0
+        if q > 0
+            string id = isL ? "L" : "S"
+            curStop      := stp
+            riskEntry    := riskDist
+            entryRiskUSD := q * riskDist
+            float tgt0 = targetR > 0 ? (isL ? refPx + targetR * riskDist : refPx - targetR * riskDist) : na
+            if useLimit
+                strategy.entry(id, isL ? strategy.long : strategy.short, qty = q, limit = lvlPx,
+                     comment = "ruptura (límite)", alert_message = msgEntry(isL ? "buy" : "sell", q, stp))
+                pendingLimit := true
+                pendUntil := bar_index + limitBars
+                pendId := id
+            else
+                strategy.entry(id, isL ? strategy.long : strategy.short, qty = q,
+                     comment = "ruptura", alert_message = msgEntry(isL ? "buy" : "sell", q, stp))
+            strategy.exit("X" + id, from_entry = id, stop = stp, limit = tgt0, alert_message = msgClose())
+            tradesToday += 1
+            placed := true
+            placedDir := isL ? 1 : -1
+            if isL
+                nLong += 1
+            else
+                nShort += 1
+
+// ------------------------------- Dibujo --------------------------------------
+plot(dayOpen, "Apertura UTC", color = color.new(color.gray, 30), style = plot.style_linebr)
+plot(dayMode ? dayHigh : na, "Máximo del día", color = color.new(color.teal, 50), style = plot.style_linebr)
+plot(dayMode ? dayLow : na, "Mínimo del día", color = color.new(color.maroon, 50), style = plot.style_linebr)
+plot(strategy.position_size != 0 ? curStop : na, "Stop activo", color = color.red, style = plot.style_linebr)
+bgcolor(quietDay ? color.new(color.gray, 92) : na, title = "Día tranquilo (ayer)")
+plotshape(placed and placedDir == 1, "Largo", shape.labelup, location.belowbar, color.green, text = "L", textcolor = color.white, size = size.tiny)
+plotshape(placed and placedDir == -1, "Corto", shape.labeldown, location.abovebar, color.red, text = "S", textcolor = color.white, size = size.tiny)
+
+// -------------------------- Tablero de estadísticas --------------------------
+var table tb = table.new(position.top_right, 2, 20, bgcolor = color.new(color.black, 25), border_width = 1)
+
+setRow(int r, string label, string value) =>
+    table.cell(tb, 0, r, label, text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    table.cell(tb, 1, r, value, text_color = color.white, text_size = size.small, text_halign = text.align_right)
+
+if showTable and barstate.islast
+    float n       = nT
+    float weeks   = math.max(1.0, (time - firstT) / 604800000.0)
+    float tpw     = n / weeks
+    float winRate = n > 0 ? nW / n * 100.0 : na
+    float wLB     = n > 0 ? f_wilsonLB(nW, n) * 100.0 : na
+    float avgWinR = nW > 0 ? sumWinR / nW : na
+    float avgLosR = (nT - nW) > 0 ? sumLossR / (nT - nW) : na
+    float payoff  = (not na(avgWinR) and not na(avgLosR) and avgLosR > 0) ? avgWinR / avgLosR : na
+    float expR    = n > 0 ? sumR / n : na
+    float sdR     = n > 1 ? math.sqrt(math.max(0.0, (sumR2 - sumR * sumR / n) / (n - 1))) : na
+    float tStat   = (not na(sdR) and sdR > 0) ? expR / (sdR / math.sqrt(n)) : na
+    float retStr  = strategy.netprofit / strategy.initial_capital * 100.0
+    float retBH   = (not na(firstClose) and firstClose > 0 and not na(lastClose)) ? (lastClose / firstClose - 1.0) * 100.0 : na
+    float oosPnl  = na(netAtSplit) ? na : strategy.netprofit - netAtSplit
+
+    float worstW = array.size(wSums) > 0 ? array.min(wSums) : na
+    int   posW   = 0
+    for k = 0 to math.max(0, array.size(wSums) - 1)
+        if array.size(wSums) > 0 and array.get(wSums, k) > 0
+            posW += 1
+    float top10 = na
+    if array.size(rList) > 0 and sumR > 0
+        array<float> srt = array.copy(rList)
+        array.sort(srt, order.descending)
+        float s10 = 0.0
+        for k = 0 to math.min(10, array.size(srt)) - 1
+            s10 += array.get(srt, k)
+        top10 := s10 / sumR * 100.0
+
+    float atrPct    = atrV / close * 100.0
+    float stopPct   = stopATR * atrPct
+    float costRNow  = stopPct > 0 ? rtCostPct / stopPct : na
+    float adrPct    = adrOk ? adr / close * 100.0 : na
+
+    string verdict = n < 30 ? "Muestra insuficiente (<30 op.)" :
+         (na(expR) or expR <= 0) ? "Sin ventaja (E <= 0)" :
+         (not na(top10) and top10 > 40.0) ? "Dependiente de pocas operaciones" :
+         (not na(tStat) and tStat >= 2.0) ? "Evidencia positiva (t >= 2)" :
+         "No concluyente"
+
+    setRow(0, "Operaciones (largos / cortos)", str.tostring(n) + " (" + str.tostring(nLong) + " / " + str.tostring(nShort) + ")")
+    setRow(1, "Operaciones por semana", str.tostring(tpw, "#.#"))
+    setRow(2, "Acierto % (límite inf. Wilson 95%)", str.tostring(winRate, "#.#") + " (" + str.tostring(wLB, "#.#") + ")")
+    setRow(3, "Ganancia media / pérdida media (R)", str.tostring(payoff, "#.##"))
+    setRow(4, "Expectativa neta por operación (R)", str.tostring(expR, "#.###"))
+    setRow(5, "Estadístico t", str.tostring(tStat, "#.##"))
+    setRow(6, "R por semana", str.tostring(sumR / weeks, "#.##"))
+    setRow(7, "Peor semana (R) / semanas positivas", str.tostring(worstW, "#.##") + " / " + str.tostring(posW) + " de " + str.tostring(array.size(wSums)))
+    setRow(8, "Top-10 operaciones: % del R neto", str.tostring(top10, "#"))
+    setRow(9, "Retorno estrategia % / comprar y mantener %", str.tostring(retStr, "#.#") + " / " + str.tostring(retBH, "#.#"))
+    setRow(10, "PnL fuera de muestra (tras el corte)", str.tostring(oosPnl, "#.##"))
+    setRow(11, "Drawdown máx.", str.tostring(strategy.max_drawdown, "#.##"))
+    setRow(12, "Veredicto", verdict)
+    setRow(13, "ATR 5m % / stop % / coste en R", str.tostring(atrPct, "#.###") + " / " + str.tostring(stopPct, "#.##") + " / " + str.tostring(costRNow, "#.##"))
+    setRow(14, "ADR % del precio", str.tostring(adrPct, "#.#"))
+    setRow(15, "Hoy: sesgo L / S", (okDmL ? "ok" : "no") + " / " + (okDmS ? "ok" : "no"))
+    setRow(16, "Hoy: espacio L / S", (okRoomL ? "ok" : "no") + " / " + (okRoomS ? "ok" : "no"))
+    setRow(17, "Hoy: día tranquilo (ayer)", quietDay ? "sí (se excluye)" : "no")
+    setRow(18, "Señales bloqueadas por coste", str.tostring(nBlocked))
+    setRow(19, "Operaciones hoy / máx. · límite diario", str.tostring(tradesToday) + " / " + str.tostring(maxTradesDay) + " · " + (dayBlocked ? "ALCANZADO" : "ok"))
